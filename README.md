@@ -21,3 +21,18 @@ node dist/cli_query.js "Private versus personal property"
 ```
 
 This should output chunks which are semantically close to `Private versus personal property` from the Communist Manifesto.
+
+## To reset DB
+
+```
+sudo -u postgres psql
+postgres=# drop database yourdbname;
+CTRL-d
+```
+
+And then just
+
+``` bash
+npx dbinstall
+npx migrate --dburl postgres://yourusername:yourpassword@yourhost/yourdbname
+```
