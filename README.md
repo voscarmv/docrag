@@ -9,7 +9,7 @@ npm install
 npm run build
 npm run db:generate
 npx dbinstall
-npx migrate --dburl postgres://yourusername:yourpassword@yourhost/yourdbname
+(set -a; . .env ; npx migrate --dburl $DATABASE_URL)
 npm run start
 ```
 
@@ -36,5 +36,5 @@ And then just
 
 ``` bash
 npx dbinstall
-npx migrate --dburl postgres://yourusername:yourpassword@yourhost/yourdbname
+(set -a; . .env ; npx migrate --dburl $DATABASE_URL)
 ```
