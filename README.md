@@ -24,6 +24,8 @@ This should output chunks which are semantically close to `Private versus person
 
 ## To reset DB
 
+Delete `DATABASE_URL` from `.env`, then
+
 ```
 sudo -u postgres psql
 postgres=# drop database yourdbname;
