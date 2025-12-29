@@ -7,7 +7,7 @@ export const textChunks = pgTable(
     documentId: text('document_id').notNull(), // To group chunks from same file
     chunkIndex: integer('chunk_index').notNull(), // Order of chunks
     content: text('content').notNull(), // The 500 char chunk
-    embedding: vector('embedding', { dimensions: 1536 }),
+    embedding: vector('embedding', { dimensions: 512 }),
   },
   (table) => [
     index('embeddingIndex').using('hnsw', table.embedding.op('vector_cosine_ops')),

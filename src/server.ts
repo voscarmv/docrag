@@ -21,7 +21,8 @@ BackendDB.route('get', '/chunks/:input', async (db, req, res) => {
         throw new Error('embedding input undefined');
     }
     const { data } = await openai.embeddings.create({
-        model: 'text-embedding-ada-002',
+        model: 'text-embedding-3-small',
+        dimensions: 512,
         input,
     });
     const queryEmbedding: Array<number> = data[0]?.embedding as  Array<number>;
@@ -41,7 +42,8 @@ BackendDB.route('post', '/chunks', async (db, req, res) => {
         content,
     } = req.body;
     const { data } = await openai.embeddings.create({
-        model: 'text-embedding-ada-002',
+        model: 'text-embedding-3-small',
+        dimensions: 512,
         input: content,
     });
     const embedding = data[0]?.embedding;
