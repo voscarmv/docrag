@@ -20,4 +20,4 @@ node dist/cli_embed.js
 node dist/cli_query.js "Private versus personal property"
 ```
 
-This should output records which are semantically close to `Private versus personal property`.
+This should output chunks which are semantically close to `Private versus personal property` from the Communist Manifesto.
