@@ -5,11 +5,11 @@ pgvector RAG backend
 ## Installation and usage
 
 ```bash
+npx dbinstall
 npm install
 npm run build
 npm run db:generate
-npx dbinstall
-(set -a; . .env ; npx migrate --dburl $DATABASE_URL)
+npm run db:migrate
 npm run start
 ```
 
@@ -36,5 +36,5 @@ And then just
 
 ``` bash
 npx dbinstall
-(set -a; . .env ; npx migrate --dburl $DATABASE_URL)
+npm run db:migrate
 ```
