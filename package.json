@@ -43,13 +43,16 @@
     "db:migrate": "npx drizzle-kit migrate"
   },
   "bin": {
-    "migrate": "./dist/migrate.js"
+    "migrate": "./dist/migrate.js",
+    "dbinstall": "./install.sh"
   },
   "dependencies": {
-    "@voscarmv/apigen": "^1.0.2",
+    "@voscarmv/apigen": "^1.0.4",
+    "axios": "^1.13.2",
     "commander": "^14.0.2",
     "dotenv": "^17.2.3",
     "drizzle-orm": "^0.45.1",
+    "openai": "^6.15.0",
     "pg": "^8.16.3"
   },
   "devDependencies": {
