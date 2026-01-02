@@ -298,3 +298,107 @@ BackendDB.route({
     },
     middlewares: [upload.single('file')]
 });
+
+// Using Ollama. Install previously with.
+// ollama pull all-minilm
+// Warning: this is untested.
+BackendDB.route({
+    method: 'post',
+    path: '/local/rtbatch',
+    handler: async (db, req, res) => {
+        if (!req.file) { throw new Error('req.file is undefined') }
+        const fileBuffer: Buffer = req.file?.buffer;
+        const text = fileBuffer.toString();
+        const fileName = req.file.originalname;
+
+        // Ollama configuration
+        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+        const OLLAMA_MODEL = 'all-minilm';
+        // all-minilm limits: 256 tokens max
+        // Use 1 char = 1 token worst case to guarantee we stay under limit
+        const MAX_CHARS_PER_CHUNK = 256;
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY_MS = 1000;
+
+        console.log(`Max chars per chunk: ${MAX_CHARS_PER_CHUNK}`);
+
+        // Chunk the text
+        const chunks: string[] = [];
+        for (let i = 0; i < text.length; i += MAX_CHARS_PER_CHUNK) {
+            const chunk = text.slice(i, i + MAX_CHARS_PER_CHUNK).trim();
+            if (chunk) {
+                chunks.push(chunk);
+            }
+        }
+
+        console.log(`Created ${chunks.length} chunks`);
+
+        // Helper function to get embedding from Ollama
+        const getEmbedding = async (text: string, retryCount = 0): Promise<number[]> => {
+            try {
+                const response = await fetch(OLLAMA_URL, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        model: OLLAMA_MODEL,
+                        prompt: text,
+                        truncate: true, // Auto-truncate if over 256 tokens
+                    }),
+                });
+
+                if (!response.ok) {
+                    throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
+                }
+
+                const data = await response.json();
+                return data.embedding;
+            } catch (error) {
+                if (retryCount < MAX_RETRIES) {
+                    console.log(`Embedding failed, retry ${retryCount + 1}/${MAX_RETRIES}`);
+                    await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * (retryCount + 1)));
+                    return getEmbedding(text, retryCount + 1);
+                } else {
+                    throw new Error(`Embedding failed after ${MAX_RETRIES} retries: ${error}`);
+                }
+            }
+        };
+
+        // Process chunks sequentially (Ollama handles one at a time)
+        let processedChunks = 0;
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            if (!chunk) { throw new Error('chunk is undefined') };
+
+            try {
+                console.log(`Processing chunk ${i + 1}/${chunks.length}`);
+
+                // Get embedding from Ollama
+                const embedding = await getEmbedding(chunk);
+
+                // Insert into database
+                await db.insert(textChunks).values({
+                    documentId: fileName,
+                    chunkIndex: i,
+                    content: chunk,
+                    embedding,
+                }).returning();
+
+                processedChunks++;
+                console.log(`Inserted chunk ${i + 1}/${chunks.length}`);
+            } catch (error) {
+                console.error(`Failed to process chunk ${i + 1}:`, error);
+                throw new Error(`Chunk ${i + 1} failed: ${error}`);
+            }
+        }
+
+        console.log(`Completed: Processed ${processedChunks} total chunks`);
+        res.status(200).json({
+            success: true,
+            chunksProcessed: processedChunks
+        });
+    },
+    middlewares: [upload.single('file')]
+});
