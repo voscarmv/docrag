@@ -13,7 +13,7 @@ async function uploadFile(filePath: string) {
     formData.append('file', fileStream, path.basename(filePath));
 
     // Upload
-    const response = await axios.post('http://localhost:3000/batch', formData, {
+    const response = await axios.post('http://localhost:3000/rtbatch', formData, {
       headers: {
         ...formData.getHeaders(), // Important! This sets correct Content-Type
       },

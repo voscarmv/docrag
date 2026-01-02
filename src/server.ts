@@ -1,7 +1,7 @@
 import { DynamicStoreBackend } from '@voscarmv/apigen';
 import { textChunks } from './schema.js'; // Your Drizzle schema
 import { sql } from 'drizzle-orm';
-import OpenAI from 'openai';
+import OpenAI, { toFile } from 'openai';
 import multer from 'multer';
 import "dotenv/config";
 
@@ -84,35 +84,50 @@ BackendDB.route({
         const chunkSize = 500;
         const chunks = [];
 
+        console.log("Chunking");
         for (let i = 0; i < text.length; i += chunkSize) {
+            console.log(`Chunk index ${i} of ${text.length}`);
             const chunk = text.slice(i, i + chunkSize).trim();
             if (chunk) {
                 chunks.push(chunk);
             }
         }
 
-        const requests = chunks.map((chunk, i) => ({
-            custom_id: `chunk-${i}`,
-            method: 'POST',
-            url: '/v1/embeddings',
-            body: {
-                model: 'text-embedding-3-small',
-                input: chunk,
-                encoding_format: 'float'
+        console.log("Generating request");
+        const requests = chunks.map((chunk, i) => {
+            console.log(`Processing chunk ${i}/${chunks.length}`);
+            return {
+                custom_id: `chunk-${i}`,
+                method: 'POST',
+                url: '/v1/embeddings',
+                body: {
+                    model: 'text-embedding-3-small',
+                    input: chunk,
+                    encoding_format: 'float',
+                    dimensions: 512
+                }
             }
-        }));
+        });
 
-        const jsonlContent = requests.map(req => JSON.stringify(req)).join('\n');
+        console.log("Stringify requests")
+        const jsonlContent = requests.map((req, i) => {
+            console.log(`Sringify request ${i} of ${requests.length}`);
+            return JSON.stringify(req);
+        }).join('\n');
 
-        // Create a Blob instead of Buffer
-        const blob = new Blob([jsonlContent], { type: 'application/jsonl' });
-
+        // Use toFile helper - more reliable than Blob
+        const file = await toFile(
+            Buffer.from(jsonlContent),
+            'batch_requests.jsonl',
+            { type: 'application/jsonl' }
+        );
         // Upload the Blob
         const batchFile = await openai.files.create({
-            file: blob,
+            file,
             purpose: 'batch'
         });
 
+        console.log("Creating batch.");
         const batch = await openai.batches.create({
             input_file_id: batchFile.id,
             endpoint: '/v1/embeddings',
@@ -122,10 +137,16 @@ BackendDB.route({
         let batchresult;
         while (true) {
             batchresult = await openai.batches.retrieve(batch.id);
+            console.log(`Status: ${batchresult.status}`);
+            if (!batchresult.request_counts) { throw new Error('batchresult.request_counts undefined') }
+            console.log(`Progress: ${batchresult.request_counts.completed}/${batchresult.request_counts.total}`);
             if (batchresult.status === 'completed') { break; }
             if (['failed', 'expired', 'cancelled'].includes(batchresult.status)) {
-                throw new Error(`Batch ${batch.status}`);
+                // console.log(JSON.stringify(batchresult));
+                if (!batchresult.errors?.data) { throw new Error(`Batch ${batchresult.status} `) }
+                throw new Error(`Batch ${batchresult.status} ${batchresult.errors.data[0]?.message}`);
             }
+            await new Promise(resolve => setTimeout(resolve, 10000));
         }
         if (!batchresult.output_file_id) { throw new Error('batchresult.output_file_id undefined') }
         const fileResponse = await openai.files.content(batchresult.output_file_id);
@@ -150,7 +171,7 @@ BackendDB.route({
             const embedding = embeddings[i]?.embedding;
             const chunkIndex = i;
 
-            if(!content) {throw new Error('embeddings[i] is undefined')}
+            if (!content) { throw new Error('embeddings[i] is undefined') }
             await db.insert(textChunks).values({
                 documentId: 'x',
                 chunkIndex,
@@ -161,6 +182,119 @@ BackendDB.route({
         }
 
         res.status(200);
+    },
+    middlewares: [upload.single('file')]
+});
+
+BackendDB.route({
+    method: 'post',
+    path: '/rtbatch',
+    handler: async (db, req, res) => {
+        if (!req.file) { throw new Error('req.file is undefined') }
+        const fileBuffer: Buffer = req.file?.buffer;
+        const text = fileBuffer.toString();
+        const fileName = req.file.originalname;
+
+        // OpenAI embedding limits:
+        // - Max 8192 tokens per individual input
+        // - Max 2048 inputs per request
+        // - Max 100,000 tokens total across all inputs per request
+        // Use character count as safe buffer (worst case: 1 token per char)
+        const MAX_CHARS_PER_CHUNK = 8192;
+        const MAX_INPUTS_PER_REQUEST = 2048;
+        const MAX_CHARS_PER_REQUEST = 100000;
+        const MAX_RETRIES = 3;
+
+        console.log(`Max chars per chunk: ${MAX_CHARS_PER_CHUNK}`);
+
+        // Chunk the text
+        const chunks: string[] = [];
+        for (let i = 0; i < text.length; i += MAX_CHARS_PER_CHUNK) {
+            const chunk = text.slice(i, i + MAX_CHARS_PER_CHUNK).trim();
+            if (chunk) {
+                chunks.push(chunk);
+            }
+        }
+
+        console.log(`Created ${chunks.length} chunks`);
+
+        // Process chunks in batches
+        let currentBatch: string[] = [];
+        let currentBatchChars = 0;
+        let processedChunks = 0;
+
+        const processBatch = async (batch: string[], startIndex: number, retryCount = 0): Promise<void> => {
+            try {
+                console.log(`Processing batch: ${batch.length} chunks (starting at ${startIndex})`);
+
+                const response = await openai.embeddings.create({
+                    model: 'text-embedding-3-small',
+                    input: batch,
+                    encoding_format: 'float',
+                    dimensions: 512
+                });
+
+                // Insert embeddings
+                for (let j = 0; j < batch.length; j++) {
+                    const chunkIndex = startIndex + j;
+                    const content = batch[j];
+                    const embedding = response.data[j]?.embedding;
+
+                    if (!content) { throw new Error('content is undefined'); }
+                    await db.insert(textChunks).values({
+                        documentId: fileName,
+                        chunkIndex,
+                        content,
+                        embedding,
+                    }).returning();
+
+                    console.log(`Inserted chunk ${chunkIndex + 1}/${chunks.length}`);
+                }
+            } catch (error) {
+                if (retryCount < MAX_RETRIES) {
+                    console.log(`Batch failed, retry ${retryCount + 1}/${MAX_RETRIES}`);
+                    await processBatch(batch, startIndex, retryCount + 1);
+                } else {
+                    throw new Error(`Batch processing failed after ${MAX_RETRIES} retries: ${error}`);
+                }
+            }
+        };
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunk = chunks[i];
+            if (!chunk) { throw new Error('chunk is undefined') };
+            const chunkChars = chunk.length;
+
+            // Check if adding this chunk would exceed limits
+            const wouldExceedChars = currentBatchChars + chunkChars > MAX_CHARS_PER_REQUEST;
+            const wouldExceedInputs = currentBatch.length >= MAX_INPUTS_PER_REQUEST;
+
+            // Process current batch if we'd exceed limits
+            if ((wouldExceedChars || wouldExceedInputs) && currentBatch.length > 0) {
+                await processBatch(currentBatch, processedChunks);
+
+                processedChunks += currentBatch.length;
+                currentBatch = [];
+                currentBatchChars = 0;
+            }
+
+            // Add current chunk to batch
+            currentBatch.push(chunk);
+            currentBatchChars += chunkChars;
+        }
+
+        // Process remaining chunks
+        if (currentBatch.length > 0) {
+            console.log(`Processing final batch: ${currentBatch.length} chunks`);
+            await processBatch(currentBatch, processedChunks);
+            processedChunks += currentBatch.length;
+        }
+
+        console.log(`Completed: Processed ${processedChunks} total chunks`);
+        res.status(200).json({
+            success: true,
+            chunksProcessed: processedChunks
+        });
     },
     middlewares: [upload.single('file')]
 });
