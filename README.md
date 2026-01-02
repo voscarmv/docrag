@@ -16,7 +16,7 @@ npm run start
 Then, on another terminal, run
 
 ```
-node dist/cli_embed.js
+node ./dist/cli_batch.js ./src/pg61.txt
 node dist/cli_query.js "Private versus personal property"
 ```
 
