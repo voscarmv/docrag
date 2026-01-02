@@ -1,7 +1,8 @@
 import axios from 'axios';
 import { readFileSync } from 'fs';
 
-const doc = './src/pg61.txt';
+const doc = process.argv[2];
+if(!doc){throw new Error('doc is undefined');}
 const text = readFileSync(doc, 'utf-8');
 const API_BASE_URL = 'http://localhost:3000';
 
