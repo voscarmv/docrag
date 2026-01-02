@@ -35,7 +35,7 @@ BackendDB.route({
         }
         const { data } = await openai.embeddings.create({
             model: 'text-embedding-3-small',
-            dimensions: 512,
+            dimensions: 384,
             input,
         });
         const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
@@ -60,7 +60,7 @@ BackendDB.route({
         } = req.body;
         const { data } = await openai.embeddings.create({
             model: 'text-embedding-3-small',
-            dimensions: 512,
+            dimensions: 384,
             input: content,
         });
         const embedding = data[0]?.embedding;
@@ -104,7 +104,7 @@ BackendDB.route({
                     model: 'text-embedding-3-small',
                     input: chunk,
                     encoding_format: 'float',
-                    dimensions: 512
+                    dimensions: 384
                 }
             }
         });
@@ -231,7 +231,7 @@ BackendDB.route({
                     model: 'text-embedding-3-small',
                     input: batch,
                     encoding_format: 'float',
-                    dimensions: 512
+                    dimensions: 384
                 });
 
                 // Insert embeddings
@@ -299,6 +299,37 @@ BackendDB.route({
     middlewares: [upload.single('file')]
 });
 
+const getEmbedding = async (text: string, retryCount = 0, OLLAMA_URL: string, OLLAMA_MODEL: string, MAX_RETRIES: number, RETRY_DELAY_MS: number): Promise<number[]> => {
+    try {
+        const response = await fetch(OLLAMA_URL, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+                model: OLLAMA_MODEL,
+                prompt: text,
+                truncate: true, // Auto-truncate if over 256 tokens
+            }),
+        });
+
+        if (!response.ok) {
+            throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        return data.embedding;
+    } catch (error) {
+        if (retryCount < MAX_RETRIES) {
+            console.log(`Embedding failed, retry ${retryCount + 1}/${MAX_RETRIES}`);
+            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * (retryCount + 1)));
+            return getEmbedding(text, retryCount + 1, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+        } else {
+            throw new Error(`Embedding failed after ${MAX_RETRIES} retries: ${error}`);
+        }
+    }
+};
+
 // Using Ollama. Install previously with.
 // ollama pull all-minilm
 // Warning: this is untested.
@@ -333,38 +364,6 @@ BackendDB.route({
 
         console.log(`Created ${chunks.length} chunks`);
 
-        // Helper function to get embedding from Ollama
-        const getEmbedding = async (text: string, retryCount = 0): Promise<number[]> => {
-            try {
-                const response = await fetch(OLLAMA_URL, {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        model: OLLAMA_MODEL,
-                        prompt: text,
-                        truncate: true, // Auto-truncate if over 256 tokens
-                    }),
-                });
-
-                if (!response.ok) {
-                    throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
-                }
-
-                const data = await response.json();
-                return data.embedding;
-            } catch (error) {
-                if (retryCount < MAX_RETRIES) {
-                    console.log(`Embedding failed, retry ${retryCount + 1}/${MAX_RETRIES}`);
-                    await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * (retryCount + 1)));
-                    return getEmbedding(text, retryCount + 1);
-                } else {
-                    throw new Error(`Embedding failed after ${MAX_RETRIES} retries: ${error}`);
-                }
-            }
-        };
-
         // Process chunks sequentially (Ollama handles one at a time)
         let processedChunks = 0;
 
@@ -376,7 +375,7 @@ BackendDB.route({
                 console.log(`Processing chunk ${i + 1}/${chunks.length}`);
 
                 // Get embedding from Ollama
-                const embedding = await getEmbedding(chunk);
+                const embedding = await getEmbedding(chunk, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
 
                 // Insert into database
                 await db.insert(textChunks).values({
@@ -401,4 +400,36 @@ BackendDB.route({
         });
     },
     middlewares: [upload.single('file')]
+});
+
+BackendDB.route({
+    method: 'get',
+    path: '/local/chunks/:input',
+    handler: async (db, req, res) => {
+        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+        const OLLAMA_MODEL = 'all-minilm';
+        // all-minilm limits: 256 tokens max
+        // Use 1 char = 1 token worst case to guarantee we stay under limit
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY_MS = 1000;
+        const { input } = req.params;
+        if (!input) {
+            throw new Error('embedding input undefined');
+        }
+        // const { data } = await openai.embeddings.create({
+        //     model: 'text-embedding-3-small',
+        //     dimensions: 384,
+        //     input,
+        // });
+        const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+
+        // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+        const vectorString = `[${queryEmbedding.join(',')}]`;
+        const results = await db
+            .select()
+            .from(textChunks)
+            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`))
+            .limit(5);
+        res.json(results);
+    }
 });
