@@ -32,8 +32,8 @@ This should output chunks which are semantically close to `Private versus person
 Alternatively if you have `ollama` and `all-minilm` installed with `ollama pull all-minilm` running on `localhost:11434`, you may use
 
 ```bash
-node ./dist/cli_local_rtbatch.sh ./src/pg61.txt
-node ./dist/cli_local_query.sh "Private versus personal property"
+node ./dist/cli_local_rtbatch.js ./src/pg61.txt
+node ./dist/cli_local_query.js "Private versus personal property"
 ```
 
 To the same effect with a penalty on chunk size and vector dimensions.
