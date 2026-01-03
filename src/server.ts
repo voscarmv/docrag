@@ -511,3 +511,121 @@ Respond with JSON only.`;
         res.json(reply.data.response);
     }
 });
+
+const dsai = new OpenAI({
+    baseURL: 'https://api.deepseek.com',
+    apiKey: process.env.DEEPSEEK_KEY
+})
+
+BackendDB.route({
+    method: 'get',
+    path: '/deepseek/chunks/:input',
+    handler: async (db, req, res) => {
+        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+        const OLLAMA_MODEL = 'all-minilm';
+        // all-minilm limits: 256 tokens max
+        // Use 1 char = 1 token worst case to guarantee we stay under limit
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY_MS = 1000;
+        const { input } = req.params;
+        if (!input) {
+            throw new Error('embedding input undefined');
+        }
+        // const { data } = await openai.embeddings.create({
+        //     model: 'text-embedding-3-small',
+        //     dimensions: 384,
+        //     input,
+        // });
+        const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+
+        // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+        const vectorString = `[${queryEmbedding.join(',')}]`;
+        const results = await db
+            .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+            .from(textChunks)
+            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
+            .limit(5);
+
+        const context = [];
+        // const context = results.map(async (result) => {
+        for (let i = 0; i < results.length; i++) {
+            let output = results[i]?.content;
+            let expand = { before: "yes", after: "yes" };
+            const index = results[i]?.chunkIndex;
+            if (!index) { throw new Error("index undefined") }
+            let indexbefore = index - 1;
+            let indexafter = index + 1;
+            // console.log("Checking", output);
+            while (expand.before === "yes" || expand.after === "yes") {
+                const beforechunk = await db
+                    .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+                    .from(textChunks)
+                    .where(eq(textChunks.chunkIndex, indexbefore));
+                const afterchunk = await db
+                    .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+                    .from(textChunks)
+                    .where(eq(textChunks.chunkIndex, indexafter));
+                const format = {
+                    type: 'object',
+                    properties: {
+                        before: {
+                            type: 'string',
+                            enum: ['yes', 'no']
+                        },
+                        after: {
+                            type: 'string',
+                            enum: ['yes', 'no']
+                        }
+                    },
+                    required: ['before', 'after']
+                };
+                const system = `The user will ask if a text chunk feels complete, you will be asked if the chunk should be expanded with some text before, and/or after.
+EXAMPLE OUTPUT
+
+{ "before": "yes", "after": "no"}
+
+`
+                const prompt = `Does the subject in this chunk feel complete?
+CHUNK:
+"${output}"
+
+If it needs the TEXT BEFORE to be complete, answer before: "yes". Otherwise before: "no".
+If it needs the TEXT AFTER to be complete, answer after: "yes". Otherwise after: "no".
+
+TEXT BEFORE:
+"${beforechunk[0]?.content}"
+
+TEXT AFTER:
+"${afterchunk[0]?.content}"
+
+Consider the chunk should be useful to this query:
+
+"${input}"
+
+Respond with JSON only.`;
+                const reply = await dsai.chat.completions.create({
+                    messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
+                    model: "deepseek-chat",
+                    response_format: { 'type': 'json_object' }
+                });
+                // console.log(`Expansion choice ${JSON.stringify(reply.data.response)}`);
+                if (!reply.choices[0]?.message.content) { throw new Error('content undefined'); }
+                expand = JSON.parse(reply.choices[0]?.message.content);
+                console.log(`Chunk ${i} expand ${JSON.stringify(expand)}`);
+                if (expand.before === "yes") { output = `${beforechunk[0]?.content}${output}`; indexbefore--; }
+                if (expand.after === "yes") { output = `${output}${afterchunk[0]?.content}`; indexafter++; }
+                // console.log(`current output`, output);
+            }
+            console.log(`Chunk ${i} done`)
+            context.push(output);
+            // });
+        }
+        console.log('Final context', JSON.stringify(context));
+        // const prompt2 = `Answer this query: ${input}\nUsing the following chunks of context:\n${JSON.stringify(context)}`;
+        const reply = await dsai.chat.completions.create({
+            messages: [{ role: 'system', content: `Use this context to reply the user's query: ${context}` }, { role: 'user', content: input }],
+            model: "deepseek-chat",
+        });
+        res.json(reply.choices[0]?.message.content);
+    }
+});
