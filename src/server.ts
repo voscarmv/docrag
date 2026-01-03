@@ -1,9 +1,11 @@
 import { DynamicStoreBackend } from '@voscarmv/apigen';
 import { textChunks } from './schema.js'; // Your Drizzle schema
-import { sql } from 'drizzle-orm';
+import { sql, eq } from 'drizzle-orm';
 import OpenAI, { toFile } from 'openai';
 import multer from 'multer';
+import axios from 'axios';
 import "dotenv/config";
+import { after } from 'node:test';
 
 const storage = multer.memoryStorage();
 
@@ -426,10 +428,85 @@ BackendDB.route({
         // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
         const vectorString = `[${queryEmbedding.join(',')}]`;
         const results = await db
-            .select()
+            .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
             .from(textChunks)
-            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`))
-            .limit(5);
-        res.json(results);
+            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
+            .limit(20);
+
+        const context = [];
+        // const context = results.map(async (result) => {
+        for (let i = 0; i < results.length; i++) {
+            let output = results[i]?.content;
+            let expand = { before: "yes", after: "yes" };
+            const index = results[i]?.chunkIndex;
+            if (!index) { throw new Error("index undefined") }
+            let indexbefore = index - 1;
+            let indexafter = index + 1;
+            // console.log("Checking", output);
+            while (expand.before === "yes" || expand.after === "yes") {
+                const beforechunk = db
+                    .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+                    .from(textChunks)
+                    .where(eq(textChunks.chunkIndex, indexbefore));
+                const afterchunk = db
+                    .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+                    .from(textChunks)
+                    .where(eq(textChunks.chunkIndex, indexafter));
+                const format = {
+                    type: 'object',
+                    properties: {
+                        before: {
+                            type: 'string',
+                            enum: ['yes', 'no']
+                        },
+                        after: {
+                            type: 'string',
+                            enum: ['yes', 'no']
+                        }
+                    },
+                    required: ['before', 'after']
+                };
+                const prompt = `Analyze this text chunk and determine if it needs context from surrounding text to be useful in answering the query.
+QUERY:
+"${input}"
+
+CHUNK:
+"${output}"
+
+TEXT BEFORE:
+"${beforechunk}"
+
+TEXT AFTER:
+"${afterchunk}"
+
+Should we expand this chunk to include text before it? Answer before: "yes" if you consider more "BEFORE" context is useful to answer the query. Otherwise answer before: "no".
+Should we expand this chunk to include text after it? Answer after: "yes" if you consider the "AFTER" context is useful to answer the query. Otherwise answer after: "no".
+
+Respond with JSON only.`;
+                const reply = await axios.post('http://localhost:11434/api/generate', {
+                    model: 'qwen2.5:1.5b',
+                    prompt: prompt,
+                    format,  // Request JSON format
+                    stream: false
+                });
+                // console.log(`Expansion choice ${JSON.stringify(reply.data.response)}`);
+                expand = JSON.parse(reply.data.response);
+                console.log(`Chunk ${i} expand ${JSON.stringify(expand)}`);
+                if (expand.before) { output = `${beforechunk}${output}`; indexbefore--; }
+                if (expand.after) { output = `${output}${afterchunk}`; indexafter++; }
+                // console.log(`current output`, output);
+            }
+            console.log(`Chunk ${i} done`)
+            context.push(output);
+            // });
+        }
+        const prompt2 = `Answer this query: ${input}\nUsing the following chunks of context:\n${JSON.stringify(context)}`;
+        const reply = await axios.post('http://localhost:11434/api/generate', {
+            model: 'qwen2.5:1.5b',
+            prompt: prompt2,
+            stream: false
+        });
+        console.log('Final context', JSON.stringify(context));
+        res.json(reply.data.response);
     }
 });

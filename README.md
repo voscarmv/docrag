@@ -29,14 +29,14 @@ node ./dist/cli_query.js "Private versus personal property"
 
 This should output chunks which are semantically close to `Private versus personal property` from the Communist Manifesto.
 
-Alternatively if you have `ollama` and `all-minilm` installed with `ollama pull all-minilm` running on `localhost:11434`, you may use
+Alternatively if you have `ollama` with `all-minilm` and `qwen2.5:1.5B` running on `localhost:11434`, you may use
 
 ```bash
 node ./dist/cli_local_rtbatch.js ./src/pg61.txt
 node ./dist/cli_local_query.js "Private versus personal property"
 ```
 
-To the same effect with a penalty on chunk size and vector dimensions.
+This will generate a proper RAG response with `qwen2.5:1.5B`
 
 ## To reset DB
 
