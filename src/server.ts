@@ -431,7 +431,7 @@ BackendDB.route({
             .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
             .from(textChunks)
             .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
-            .limit(20);
+            .limit(5);
 
         const context = [];
         // const context = results.map(async (result) => {
@@ -444,11 +444,11 @@ BackendDB.route({
             let indexafter = index + 1;
             // console.log("Checking", output);
             while (expand.before === "yes" || expand.after === "yes") {
-                const beforechunk = db
+                const beforechunk = await db
                     .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
                     .from(textChunks)
                     .where(eq(textChunks.chunkIndex, indexbefore));
-                const afterchunk = db
+                const afterchunk = await db
                     .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
                     .from(textChunks)
                     .where(eq(textChunks.chunkIndex, indexafter));
@@ -474,17 +474,17 @@ CHUNK:
 "${output}"
 
 TEXT BEFORE:
-"${beforechunk}"
+"${beforechunk[0]?.content}"
 
 TEXT AFTER:
-"${afterchunk}"
+"${afterchunk[0]?.content}"
 
 Should we expand this chunk to include text before it? Answer before: "yes" if you consider more "BEFORE" context is useful to answer the query. Otherwise answer before: "no".
 Should we expand this chunk to include text after it? Answer after: "yes" if you consider the "AFTER" context is useful to answer the query. Otherwise answer after: "no".
 
 Respond with JSON only.`;
                 const reply = await axios.post('http://localhost:11434/api/generate', {
-                    model: 'qwen2.5:1.5b',
+                    model: 'qwen2.5:0.5b',
                     prompt: prompt,
                     format,  // Request JSON format
                     stream: false
@@ -492,21 +492,21 @@ Respond with JSON only.`;
                 // console.log(`Expansion choice ${JSON.stringify(reply.data.response)}`);
                 expand = JSON.parse(reply.data.response);
                 console.log(`Chunk ${i} expand ${JSON.stringify(expand)}`);
-                if (expand.before) { output = `${beforechunk}${output}`; indexbefore--; }
-                if (expand.after) { output = `${output}${afterchunk}`; indexafter++; }
+                if (expand.before === "yes") { output = `${beforechunk[0]?.content}${output}`; indexbefore--; }
+                if (expand.after === "yes") { output = `${output}${afterchunk[0]?.content}`; indexafter++; }
                 // console.log(`current output`, output);
             }
             console.log(`Chunk ${i} done`)
             context.push(output);
             // });
         }
+        console.log('Final context', JSON.stringify(context));
         const prompt2 = `Answer this query: ${input}\nUsing the following chunks of context:\n${JSON.stringify(context)}`;
         const reply = await axios.post('http://localhost:11434/api/generate', {
             model: 'qwen2.5:1.5b',
             prompt: prompt2,
             stream: false
         });
-        console.log('Final context', JSON.stringify(context));
         res.json(reply.data.response);
     }
 });
