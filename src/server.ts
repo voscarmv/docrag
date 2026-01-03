@@ -466,12 +466,12 @@ BackendDB.route({
                     },
                     required: ['before', 'after']
                 };
-                const prompt = `Analyze this text chunk and determine if it needs context from surrounding text to be useful in answering the query.
-QUERY:
-"${input}"
-
+                const prompt = `Does this chunk feel complete?
 CHUNK:
 "${output}"
+
+If it needs the TEXT BEFORE to be complete, answer before: "yes". Otherwise before: "no".
+If it needs the TEXT AFTER to be complete, answer after: "yes". Otherwise after: "no".
 
 TEXT BEFORE:
 "${beforechunk[0]?.content}"
@@ -479,12 +479,13 @@ TEXT BEFORE:
 TEXT AFTER:
 "${afterchunk[0]?.content}"
 
-Should we expand this chunk to include text before it? Answer before: "yes" if you consider more "BEFORE" context is useful to answer the query. Otherwise answer before: "no".
-Should we expand this chunk to include text after it? Answer after: "yes" if you consider the "AFTER" context is useful to answer the query. Otherwise answer after: "no".
+Consider the chunk should be useful to this query:
+
+"${input}"
 
 Respond with JSON only.`;
                 const reply = await axios.post('http://localhost:11434/api/generate', {
-                    model: 'qwen2.5:0.5b',
+                    model: 'qwen2.5:1.5b',
                     prompt: prompt,
                     format,  // Request JSON format
                     stream: false
