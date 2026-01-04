@@ -44,7 +44,7 @@ This will generate a proper RAG response with `qwen2.5:1.5B`
 
 This plot shows the cosine distance between a pivot text chunk (46576) and 200 surrounding chunks (±100). The purple area represents raw distances, while the orange rolling average reveals sustained semantic shifts. Lower distances indicate similar content; the green median line helps identify where the document diverges from typical similarity. Notable spikes suggest topic boundaries or narrative shifts in the text.
 
-This can help efficiently identify consecutive neighboring chunks around a pivot that contain a common semantic theme, especially in raw text that is not previously sectioned or that has no metadata to clearly identify semantif shifts. See `src/cli_recursive_query.ts`
+A simple `pgvector` query was used to generate this set of vector distances. This can help efficiently identify consecutive neighboring chunks, around a pivot, which constitute a common semantic theme (those whose rolling average is sub-median). This is especially convenient for semantically chunking raw text that is not previously sectioned or that has no metadata (such as subtitles) that can clearly indicate semantic shifts. See `src/cli_recursive_query.ts` and `src/server.ts`
 
 ## To reset DB
 
