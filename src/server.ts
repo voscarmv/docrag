@@ -629,3 +629,56 @@ Respond with JSON only.`;
         res.json(reply.choices[0]?.message.content);
     }
 });
+
+BackendDB.route({
+    method: 'get',
+    path: '/recursive/chunks/:input',
+    handler: async (db, req, res) => {
+        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+        const OLLAMA_MODEL = 'all-minilm';
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY_MS = 1000;
+        const { input } = req.params;
+        if (!input) {
+            throw new Error('embedding input undefined');
+        }
+        const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+
+        // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+        const vectorString = `[${queryEmbedding.join(',')}]`;
+
+        const results = await db
+            .select({ embedding: textChunks.embedding, chunkIndex: textChunks.chunkIndex })
+            .from(textChunks)
+            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
+            .limit(5);
+
+        // loop through all results later
+        const pivotEmbedding = results[0];
+
+        const pivotChunkIndex = pivotEmbedding?.chunkIndex;
+        if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
+        console.log(`pivot index ${pivotChunkIndex}`);
+        const pivotEmbeddingSubquery = db
+            .select({ embedding: textChunks.embedding })
+            .from(textChunks)
+            .where(eq(textChunks.chunkIndex, pivotChunkIndex))
+            .limit(1);
+        const distanceFromPivot = sql<number>`(${pivotEmbeddingSubquery}) <=> ${textChunks.embedding}`;
+
+        // Use it in your query
+        const results2 = await db
+            .select({
+                pivotChunkIndex: sql<number>`${pivotChunkIndex}`,
+                comparedChunkIndex: textChunks.chunkIndex,
+                distance: distanceFromPivot
+            })
+            .from(textChunks)
+            .where(
+                sql`${textChunks.chunkIndex} BETWEEN ${pivotChunkIndex - 100} AND ${pivotChunkIndex + 100}`
+            )
+            .orderBy(textChunks.chunkIndex);
+
+        res.json(results2);
+    }
+});

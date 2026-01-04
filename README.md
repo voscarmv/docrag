@@ -38,6 +38,14 @@ node ./dist/cli_local_query.js "Private versus personal property"
 
 This will generate a proper RAG response with `qwen2.5:1.5B`
 
+## Semantic Distance Visualization
+
+![Semantic Distance Plot](./image.png)
+
+This plot shows the cosine distance between a pivot text chunk (46576) and 200 surrounding chunks (±100). The purple area represents raw distances, while the orange rolling average reveals sustained semantic shifts. Lower distances indicate similar content; the green median line helps identify where the document diverges from typical similarity. Notable spikes suggest topic boundaries or narrative shifts in the text.
+
+This can help efficiently identify consecutive neighboring chunks around a pivot that contain a common semantic theme, especially in raw text that is not previously sectioned or that has no metadata to clearly identify semantif shifts. See `src/cli_recursive_query.ts`
+
 ## To reset DB
 
 Delete `DATABASE_URL` from `.env`, then
