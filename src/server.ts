@@ -682,3 +682,93 @@ BackendDB.route({
         res.json(results2);
     }
 });
+
+BackendDB.route({
+    method: 'get',
+    path: '/semantic/chunks/:input',
+    handler: async (db, req, res) => {
+        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+        const OLLAMA_MODEL = 'all-minilm';
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY_MS = 1000;
+        const { input } = req.params;
+        if (!input) {
+            throw new Error('embedding input undefined');
+        }
+        const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+
+        // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+        const vectorString = `[${queryEmbedding.join(',')}]`;
+
+        const results = await db
+            .select({ embedding: textChunks.embedding, chunkIndex: textChunks.chunkIndex })
+            .from(textChunks)
+            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
+            .limit(15);
+
+        // loop through all results later
+        const pivotEmbedding = results[0];
+
+        const pivotChunkIndex = pivotEmbedding?.chunkIndex;
+        if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
+        console.log(`pivot index ${pivotChunkIndex}`);
+        const pivotEmbeddingSubquery = db
+            .select({ embedding: textChunks.embedding })
+            .from(textChunks)
+            .where(eq(textChunks.chunkIndex, pivotChunkIndex))
+            .limit(1);
+        const distanceFromPivot = sql<number>`(${pivotEmbeddingSubquery}) <=> ${textChunks.embedding}`;
+
+
+        // Use it in your query
+        const range = 115;
+        const results2 = await db
+            .select({
+                pivotChunkIndex: sql<number>`${pivotChunkIndex}`,
+                comparedChunkIndex: textChunks.chunkIndex,
+                distance: distanceFromPivot,
+                content: textChunks.content
+            })
+            .from(textChunks)
+            .where(
+                sql`${textChunks.chunkIndex} BETWEEN ${pivotChunkIndex - range} AND ${pivotChunkIndex + range}`
+            )
+            .orderBy(textChunks.chunkIndex);
+        const sum = results2.reduce((acc, val) => acc + val.distance, 0);
+        const mean = sum / results2.length;
+        const roll = 15;
+        let leftra = 0;
+        let rightra = 0;
+        let leftix, rightix;
+        for (
+            let i = range, j = range;
+            i > roll && j < results2.length - roll;
+            i--, j++
+        ) {
+            if (leftra < mean && !rightix) {
+                for (let k = i - roll; k < i + roll; i++) {
+                    leftra += results2[k]?.distance as number;
+                }
+                leftra /= (2 * roll);
+            } else if (!leftix) {
+                leftix = i;
+            }
+            if (rightra < mean) {
+                for (let k = j - roll; k < j + roll; j++) {
+                    rightra += results2[k]?.distance as number;
+                }
+                rightra /= (2 * roll);
+            } else if (!rightix) {
+                rightix = j;
+            }
+            if (leftix && rightix) { break; }
+        }
+        const chunks = results2.slice(leftix, rightix);
+        const context = JSON.stringify(chunks.map((chunk) => chunk.content));
+        const reply = await dsai.chat.completions.create({
+            messages: [{ role: 'system', content: `Quote this context to reply the user's query: ${context}` }, { role: 'user', content: input }],
+            model: "deepseek-chat",
+        });
+        res.json(reply.choices[0]?.message.content);
+    }
+});
