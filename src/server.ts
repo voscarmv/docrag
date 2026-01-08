@@ -711,7 +711,6 @@ BackendDB.route({
             const pivotEmbedding = results[x];
             const pivotChunkIndex = pivotEmbedding?.chunkIndex;
             if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
-            console.log(`pivot index ${pivotChunkIndex}`);
             const pivotEmbeddingSubquery = db
                 .select({ embedding: textChunks.embedding })
                 .from(textChunks)
@@ -743,7 +742,7 @@ BackendDB.route({
                 i--, j++
             ) {
                 if (leftra < mean && !rightix) {
-                    for (let k = i - roll; k < i + roll; i++) {
+                    for (let k = i - roll; k < i + roll; k++) {
                         leftra += results2[k]?.distance as number;
                     }
                     leftra /= (2 * roll);
@@ -751,7 +750,7 @@ BackendDB.route({
                     leftix = i;
                 }
                 if (rightra < mean) {
-                    for (let k = j - roll; k < j + roll; j++) {
+                    for (let k = j - roll; k < j + roll; k++) {
                         rightra += results2[k]?.distance as number;
                     }
                     rightra /= (2 * roll);
@@ -763,8 +762,6 @@ BackendDB.route({
             const chunks = results2.slice(leftix, rightix);
             const finalchunk = chunks.map((chunk) => chunk.content).join('');
             context.push(finalchunk);
-            console.log('Final chunk here');
-            console.log(finalchunk);
         }
         const reply = await dsai.chat.completions.create({
             messages: [
