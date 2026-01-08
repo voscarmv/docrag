@@ -700,15 +700,28 @@ BackendDB.route({
         // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
         const vectorString = `[${queryEmbedding.join(',')}]`;
 
+        const limit = 500;
         const results = await db
-            .select({ embedding: textChunks.embedding, chunkIndex: textChunks.chunkIndex })
+            .select({
+                embedding: textChunks.embedding,
+                chunkIndex: textChunks.chunkIndex,
+                distance: sql<number>`embedding <=> ${vectorString}::vector`
+            })
             .from(textChunks)
-            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
-            .limit(15);
+            .orderBy(sql`embedding <=> ${vectorString}::vector`)
+            .limit(limit);
+
+        const mindist = Math.min(...results.map((chunk) => chunk.distance));
+        const maxdist = Math.max(...results.map((chunk) => chunk.distance));
+        const toppercent = 60;
+        const threshhold = mindist+((toppercent*(maxdist - mindist))/100);
+
+        const filtered = results.filter((chunk) => chunk.distance <= threshhold);
+        console.log('smallest picked', filtered.length);
 
         const context = [];
-        for (let x = 0; x < results.length; x++) {
-            const pivotEmbedding = results[x];
+        for (let x = 0; x < filtered.length; x++) {
+            const pivotEmbedding = filtered[x];
             const pivotChunkIndex = pivotEmbedding?.chunkIndex;
             if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
             const pivotEmbeddingSubquery = db
