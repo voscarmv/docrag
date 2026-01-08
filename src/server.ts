@@ -706,67 +706,77 @@ BackendDB.route({
             .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
             .limit(15);
 
-        // loop through all results later
-        const pivotEmbedding = results[0];
-
-        const pivotChunkIndex = pivotEmbedding?.chunkIndex;
-        if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
-        console.log(`pivot index ${pivotChunkIndex}`);
-        const pivotEmbeddingSubquery = db
-            .select({ embedding: textChunks.embedding })
-            .from(textChunks)
-            .where(eq(textChunks.chunkIndex, pivotChunkIndex))
-            .limit(1);
-        const distanceFromPivot = sql<number>`(${pivotEmbeddingSubquery}) <=> ${textChunks.embedding}`;
-
-
-        // Use it in your query
-        const range = 115;
-        const results2 = await db
-            .select({
-                pivotChunkIndex: sql<number>`${pivotChunkIndex}`,
-                comparedChunkIndex: textChunks.chunkIndex,
-                distance: distanceFromPivot,
-                content: textChunks.content
-            })
-            .from(textChunks)
-            .where(
-                sql`${textChunks.chunkIndex} BETWEEN ${pivotChunkIndex - range} AND ${pivotChunkIndex + range}`
-            )
-            .orderBy(textChunks.chunkIndex);
-        const sum = results2.reduce((acc, val) => acc + val.distance, 0);
-        const mean = sum / results2.length;
-        const roll = 15;
-        let leftra = 0;
-        let rightra = 0;
-        let leftix, rightix;
-        for (
-            let i = range, j = range;
-            i > roll && j < results2.length - roll;
-            i--, j++
-        ) {
-            if (leftra < mean && !rightix) {
-                for (let k = i - roll; k < i + roll; i++) {
-                    leftra += results2[k]?.distance as number;
+        const context = [];
+        for (let x = 0; x < results.length; x++) {
+            const pivotEmbedding = results[x];
+            const pivotChunkIndex = pivotEmbedding?.chunkIndex;
+            if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
+            console.log(`pivot index ${pivotChunkIndex}`);
+            const pivotEmbeddingSubquery = db
+                .select({ embedding: textChunks.embedding })
+                .from(textChunks)
+                .where(eq(textChunks.chunkIndex, pivotChunkIndex))
+                .limit(1);
+            const distanceFromPivot = sql<number>`(${pivotEmbeddingSubquery}) <=> ${textChunks.embedding}`;
+            const range = 115;
+            const results2 = await db
+                .select({
+                    pivotChunkIndex: sql<number>`${pivotChunkIndex}`,
+                    comparedChunkIndex: textChunks.chunkIndex,
+                    distance: distanceFromPivot,
+                    content: textChunks.content
+                })
+                .from(textChunks)
+                .where(
+                    sql`${textChunks.chunkIndex} BETWEEN ${pivotChunkIndex - range} AND ${pivotChunkIndex + range}`
+                )
+                .orderBy(textChunks.chunkIndex);
+            const sum = results2.reduce((acc, val) => acc + val.distance, 0);
+            const mean = sum / results2.length;
+            const roll = 15;
+            let leftra = 0;
+            let rightra = 0;
+            let leftix, rightix;
+            for (
+                let i = range, j = range;
+                i > roll && j < results2.length - roll;
+                i--, j++
+            ) {
+                if (leftra < mean && !rightix) {
+                    for (let k = i - roll; k < i + roll; i++) {
+                        leftra += results2[k]?.distance as number;
+                    }
+                    leftra /= (2 * roll);
+                } else if (!leftix) {
+                    leftix = i;
                 }
-                leftra /= (2 * roll);
-            } else if (!leftix) {
-                leftix = i;
-            }
-            if (rightra < mean) {
-                for (let k = j - roll; k < j + roll; j++) {
-                    rightra += results2[k]?.distance as number;
+                if (rightra < mean) {
+                    for (let k = j - roll; k < j + roll; j++) {
+                        rightra += results2[k]?.distance as number;
+                    }
+                    rightra /= (2 * roll);
+                } else if (!rightix) {
+                    rightix = j;
                 }
-                rightra /= (2 * roll);
-            } else if (!rightix) {
-                rightix = j;
+                if (leftix && rightix) { break; }
             }
-            if (leftix && rightix) { break; }
+            const chunks = results2.slice(leftix, rightix);
+            const finalchunk = chunks.map((chunk) => chunk.content).join('');
+            context.push(finalchunk);
+            console.log('Final chunk here');
+            console.log(finalchunk);
         }
-        const chunks = results2.slice(leftix, rightix);
-        const context = JSON.stringify(chunks.map((chunk) => chunk.content));
         const reply = await dsai.chat.completions.create({
-            messages: [{ role: 'system', content: `Quote this context to reply the user's query: ${context}` }, { role: 'user', content: input }],
+            messages: [
+                {
+                    role: 'system',
+                    content: `Quote this context to reply the user's query: ${JSON.stringify(context)}`
+                },
+                {
+                    role: 'user',
+                    content: input
+                }
+            ],
             model: "deepseek-chat",
         });
         res.json(reply.choices[0]?.message.content);
