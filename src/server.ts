@@ -5,7 +5,6 @@ import OpenAI, { toFile } from 'openai';
 import multer from 'multer';
 import axios from 'axios';
 import "dotenv/config";
-import { after } from 'node:test';
 
 const storage = multer.memoryStorage();
 
