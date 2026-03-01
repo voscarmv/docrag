@@ -9,463 +9,470 @@ import "dotenv/config";
 const storage = multer.memoryStorage();
 
 const upload = multer({
-    storage: storage,
-    limits: {
-        fileSize: 1024 * 1024 * 1024, // 1 GB limit (be careful with memory limits)
-    }
+  storage: storage,
+  limits: {
+    fileSize: 1024 * 1024 * 1024, // 1 GB limit (be careful with memory limits)
+  }
 });
 
 const openai = new OpenAI({
-    apiKey: process.env.OPENAI_API_KEY,
+  apiKey: process.env.OPENAI_API_KEY,
 });
 
 // Create backend instance
 export const BackendDB = new DynamicStoreBackend({
-    dbUrl: process.env.DATABASE_URL!,
-    port: 3000
+  dbUrl: process.env.DATABASE_URL!,
+  port: 3000
 });
 
 // Add a public route
 BackendDB.route({
-    method: 'get',
-    path: '/chunks/:input',
-    handler: async (db, req, res) => {
-        const { input } = req.params;
-        if (!input) {
-            throw new Error('embedding input undefined');
-        }
-        const { data } = await openai.embeddings.create({
-            model: 'text-embedding-3-small',
-            dimensions: 384,
-            input,
-        });
-        const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
-        const vectorString = `[${queryEmbedding.join(',')}]`;
-        const results = await db
-            .select()
-            .from(textChunks)
-            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`))
-            .limit(5);
-        res.json(results);
+  method: 'get',
+  path: '/chunks/:input',
+  handler: async (db, req, res) => {
+    const { input } = req.params;
+    if (!input) {
+      throw new Error('embedding input undefined');
     }
+    const { data } = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      dimensions: 384,
+      input,
+    });
+    const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+    const vectorString = `[${queryEmbedding.join(',')}]`;
+    const results = await db
+      .select()
+      .from(textChunks)
+      .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`))
+      .limit(5);
+    res.json(results);
+  }
 });
 
 BackendDB.route({
-    method: 'post',
-    path: '/chunks',
-    handler: async (db, req, res) => {
-        const {
-            documentId,
-            chunkIndex,
-            content,
-        } = req.body;
-        const { data } = await openai.embeddings.create({
-            model: 'text-embedding-3-small',
-            dimensions: 384,
-            input: content,
+  method: 'post',
+  path: '/chunks',
+  handler: async (db, req, res) => {
+    const {
+      documentId,
+      chunkIndex,
+      content,
+    } = req.body;
+    const { data } = await openai.embeddings.create({
+      model: 'text-embedding-3-small',
+      dimensions: 384,
+      input: content,
+    });
+    const embedding = data[0]?.embedding;
+    const newChunk = await db.insert(textChunks).values({
+      documentId,
+      chunkIndex,
+      content,
+      embedding,
+    }).returning();
+    res.json(newChunk[0]);
+  }
+});
+
+BackendDB.route({
+  method: 'post',
+  path: '/batch',
+  handler: async (db, req, res) => {
+    if (!req.file) { throw new Error('req.file is undefined') }
+    const fileBuffer: Buffer = req.file?.buffer;
+    const text = fileBuffer.toString();
+    const chunkSize = 500;
+    const chunks = [];
+
+    console.log("Chunking");
+    for (let i = 0; i < text.length; i += chunkSize) {
+      console.log(`Chunk index ${i} of ${text.length}`);
+      const chunk = text.slice(i, i + chunkSize).trim();
+      if (chunk) {
+        chunks.push(chunk);
+      }
+    }
+
+    console.log("Generating request");
+    const requests = chunks.map((chunk, i) => {
+      console.log(`Processing chunk ${i}/${chunks.length}`);
+      return {
+        custom_id: `chunk-${i}`,
+        method: 'POST',
+        url: '/v1/embeddings',
+        body: {
+          model: 'text-embedding-3-small',
+          input: chunk,
+          encoding_format: 'float',
+          dimensions: 384
+        }
+      }
+    });
+
+    console.log("Stringify requests")
+    const jsonlContent = requests.map((req, i) => {
+      console.log(`Sringify request ${i} of ${requests.length}`);
+      return JSON.stringify(req);
+    }).join('\n');
+
+    // Use toFile helper - more reliable than Blob
+    const file = await toFile(
+      Buffer.from(jsonlContent),
+      'batch_requests.jsonl',
+      { type: 'application/jsonl' }
+    );
+    // Upload the Blob
+    const batchFile = await openai.files.create({
+      file,
+      purpose: 'batch'
+    });
+
+    console.log("Creating batch.");
+    const batch = await openai.batches.create({
+      input_file_id: batchFile.id,
+      endpoint: '/v1/embeddings',
+      completion_window: '24h'
+    });
+
+    let batchresult;
+    while (true) {
+      batchresult = await openai.batches.retrieve(batch.id);
+      console.log(`Status: ${batchresult.status}`);
+      if (!batchresult.request_counts) { throw new Error('batchresult.request_counts undefined') }
+      console.log(`Progress: ${batchresult.request_counts.completed}/${batchresult.request_counts.total}`);
+      if (batchresult.status === 'completed') { break; }
+      if (['failed', 'expired', 'cancelled'].includes(batchresult.status)) {
+        // console.log(JSON.stringify(batchresult));
+        if (!batchresult.errors?.data) { throw new Error(`Batch ${batchresult.status} `) }
+        throw new Error(`Batch ${batchresult.status} ${batchresult.errors.data[0]?.message}`);
+      }
+      await new Promise(resolve => setTimeout(resolve, 10000));
+    }
+    if (!batchresult.output_file_id) { throw new Error('batchresult.output_file_id undefined') }
+    const fileResponse = await openai.files.content(batchresult.output_file_id);
+    const fileContents = await fileResponse.text();
+
+    const lines = fileContents.trim().split('\n');
+    const embeddings = [];
+
+    for (const line of lines) {
+      const result = JSON.parse(line);
+      const chunkIndex = parseInt(result.custom_id.split('-')[1]);
+      embeddings.push({
+        chunkIndex,
+        embedding: result.response.body.data[0].embedding
+      });
+    }
+
+    embeddings.sort((a, b) => a.chunkIndex - b.chunkIndex);
+
+    for (let i = 0; i < chunks.length; i++) {
+      const content = chunks[i];
+      const embedding = embeddings[i]?.embedding;
+      const chunkIndex = i;
+
+      if (!content) { throw new Error('embeddings[i] is undefined') }
+      await db.insert(textChunks).values({
+        documentId: 'x',
+        chunkIndex,
+        content,
+        embedding,
+      }).returning();
+      console.log(`Inserted ${i + 1}/${chunks.length} chunks`);
+    }
+
+    res.status(200);
+  },
+  middlewares: [upload.single('file')]
+});
+
+BackendDB.route({
+  method: 'post',
+  path: '/rtbatch',
+  handler: async (db, req, res) => {
+    if (!req.file) { throw new Error('req.file is undefined') }
+    const fileBuffer: Buffer = req.file?.buffer;
+    const text = fileBuffer.toString();
+    const fileName = req.file.originalname;
+
+    // OpenAI embedding limits:
+    // - Max 8192 tokens per individual input
+    // - Max 2048 inputs per request
+    // - Max 100,000 tokens total across all inputs per request
+    // Use character count as safe buffer (worst case: 1 token per char)
+    const MAX_CHARS_PER_CHUNK = 8192;
+    const MAX_INPUTS_PER_REQUEST = 2048;
+    const MAX_CHARS_PER_REQUEST = 100000;
+    const MAX_RETRIES = 3;
+
+    console.log(`Max chars per chunk: ${MAX_CHARS_PER_CHUNK}`);
+
+    // Chunk the text
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += MAX_CHARS_PER_CHUNK) {
+      const chunk = text.slice(i, i + MAX_CHARS_PER_CHUNK).trim();
+      if (chunk) {
+        chunks.push(chunk);
+      }
+    }
+
+    console.log(`Created ${chunks.length} chunks`);
+
+    // Process chunks in batches
+    let currentBatch: string[] = [];
+    let currentBatchChars = 0;
+    let processedChunks = 0;
+
+    const processBatch = async (batch: string[], startIndex: number, retryCount = 0): Promise<void> => {
+      try {
+        console.log(`Processing batch: ${batch.length} chunks (starting at ${startIndex})`);
+
+        const response = await openai.embeddings.create({
+          model: 'text-embedding-3-small',
+          input: batch,
+          encoding_format: 'float',
+          dimensions: 384
         });
-        const embedding = data[0]?.embedding;
-        const newChunk = await db.insert(textChunks).values({
-            documentId,
+
+        // Insert embeddings
+        for (let j = 0; j < batch.length; j++) {
+          const chunkIndex = startIndex + j;
+          const content = batch[j];
+          const embedding = response.data[j]?.embedding;
+
+          if (!content) { throw new Error('content is undefined'); }
+          await db.insert(textChunks).values({
+            documentId: fileName,
             chunkIndex,
             content,
             embedding,
-        }).returning();
-        res.json(newChunk[0]);
-    }
-});
+          }).returning();
 
-BackendDB.route({
-    method: 'post',
-    path: '/batch',
-    handler: async (db, req, res) => {
-        if (!req.file) { throw new Error('req.file is undefined') }
-        const fileBuffer: Buffer = req.file?.buffer;
-        const text = fileBuffer.toString();
-        const chunkSize = 500;
-        const chunks = [];
-
-        console.log("Chunking");
-        for (let i = 0; i < text.length; i += chunkSize) {
-            console.log(`Chunk index ${i} of ${text.length}`);
-            const chunk = text.slice(i, i + chunkSize).trim();
-            if (chunk) {
-                chunks.push(chunk);
-            }
+          console.log(`Inserted chunk ${chunkIndex + 1}/${chunks.length}`);
         }
-
-        console.log("Generating request");
-        const requests = chunks.map((chunk, i) => {
-            console.log(`Processing chunk ${i}/${chunks.length}`);
-            return {
-                custom_id: `chunk-${i}`,
-                method: 'POST',
-                url: '/v1/embeddings',
-                body: {
-                    model: 'text-embedding-3-small',
-                    input: chunk,
-                    encoding_format: 'float',
-                    dimensions: 384
-                }
-            }
-        });
-
-        console.log("Stringify requests")
-        const jsonlContent = requests.map((req, i) => {
-            console.log(`Sringify request ${i} of ${requests.length}`);
-            return JSON.stringify(req);
-        }).join('\n');
-
-        // Use toFile helper - more reliable than Blob
-        const file = await toFile(
-            Buffer.from(jsonlContent),
-            'batch_requests.jsonl',
-            { type: 'application/jsonl' }
-        );
-        // Upload the Blob
-        const batchFile = await openai.files.create({
-            file,
-            purpose: 'batch'
-        });
-
-        console.log("Creating batch.");
-        const batch = await openai.batches.create({
-            input_file_id: batchFile.id,
-            endpoint: '/v1/embeddings',
-            completion_window: '24h'
-        });
-
-        let batchresult;
-        while (true) {
-            batchresult = await openai.batches.retrieve(batch.id);
-            console.log(`Status: ${batchresult.status}`);
-            if (!batchresult.request_counts) { throw new Error('batchresult.request_counts undefined') }
-            console.log(`Progress: ${batchresult.request_counts.completed}/${batchresult.request_counts.total}`);
-            if (batchresult.status === 'completed') { break; }
-            if (['failed', 'expired', 'cancelled'].includes(batchresult.status)) {
-                // console.log(JSON.stringify(batchresult));
-                if (!batchresult.errors?.data) { throw new Error(`Batch ${batchresult.status} `) }
-                throw new Error(`Batch ${batchresult.status} ${batchresult.errors.data[0]?.message}`);
-            }
-            await new Promise(resolve => setTimeout(resolve, 10000));
-        }
-        if (!batchresult.output_file_id) { throw new Error('batchresult.output_file_id undefined') }
-        const fileResponse = await openai.files.content(batchresult.output_file_id);
-        const fileContents = await fileResponse.text();
-
-        const lines = fileContents.trim().split('\n');
-        const embeddings = [];
-
-        for (const line of lines) {
-            const result = JSON.parse(line);
-            const chunkIndex = parseInt(result.custom_id.split('-')[1]);
-            embeddings.push({
-                chunkIndex,
-                embedding: result.response.body.data[0].embedding
-            });
-        }
-
-        embeddings.sort((a, b) => a.chunkIndex - b.chunkIndex);
-
-        for (let i = 0; i < chunks.length; i++) {
-            const content = chunks[i];
-            const embedding = embeddings[i]?.embedding;
-            const chunkIndex = i;
-
-            if (!content) { throw new Error('embeddings[i] is undefined') }
-            await db.insert(textChunks).values({
-                documentId: 'x',
-                chunkIndex,
-                content,
-                embedding,
-            }).returning();
-            console.log(`Inserted ${i + 1}/${chunks.length} chunks`);
-        }
-
-        res.status(200);
-    },
-    middlewares: [upload.single('file')]
-});
-
-BackendDB.route({
-    method: 'post',
-    path: '/rtbatch',
-    handler: async (db, req, res) => {
-        if (!req.file) { throw new Error('req.file is undefined') }
-        const fileBuffer: Buffer = req.file?.buffer;
-        const text = fileBuffer.toString();
-        const fileName = req.file.originalname;
-
-        // OpenAI embedding limits:
-        // - Max 8192 tokens per individual input
-        // - Max 2048 inputs per request
-        // - Max 100,000 tokens total across all inputs per request
-        // Use character count as safe buffer (worst case: 1 token per char)
-        const MAX_CHARS_PER_CHUNK = 8192;
-        const MAX_INPUTS_PER_REQUEST = 2048;
-        const MAX_CHARS_PER_REQUEST = 100000;
-        const MAX_RETRIES = 3;
-
-        console.log(`Max chars per chunk: ${MAX_CHARS_PER_CHUNK}`);
-
-        // Chunk the text
-        const chunks: string[] = [];
-        for (let i = 0; i < text.length; i += MAX_CHARS_PER_CHUNK) {
-            const chunk = text.slice(i, i + MAX_CHARS_PER_CHUNK).trim();
-            if (chunk) {
-                chunks.push(chunk);
-            }
-        }
-
-        console.log(`Created ${chunks.length} chunks`);
-
-        // Process chunks in batches
-        let currentBatch: string[] = [];
-        let currentBatchChars = 0;
-        let processedChunks = 0;
-
-        const processBatch = async (batch: string[], startIndex: number, retryCount = 0): Promise<void> => {
-            try {
-                console.log(`Processing batch: ${batch.length} chunks (starting at ${startIndex})`);
-
-                const response = await openai.embeddings.create({
-                    model: 'text-embedding-3-small',
-                    input: batch,
-                    encoding_format: 'float',
-                    dimensions: 384
-                });
-
-                // Insert embeddings
-                for (let j = 0; j < batch.length; j++) {
-                    const chunkIndex = startIndex + j;
-                    const content = batch[j];
-                    const embedding = response.data[j]?.embedding;
-
-                    if (!content) { throw new Error('content is undefined'); }
-                    await db.insert(textChunks).values({
-                        documentId: fileName,
-                        chunkIndex,
-                        content,
-                        embedding,
-                    }).returning();
-
-                    console.log(`Inserted chunk ${chunkIndex + 1}/${chunks.length}`);
-                }
-            } catch (error) {
-                if (retryCount < MAX_RETRIES) {
-                    console.log(`Batch failed, retry ${retryCount + 1}/${MAX_RETRIES}`);
-                    await processBatch(batch, startIndex, retryCount + 1);
-                } else {
-                    throw new Error(`Batch processing failed after ${MAX_RETRIES} retries: ${error}`);
-                }
-            }
-        };
-
-        for (let i = 0; i < chunks.length; i++) {
-            const chunk = chunks[i];
-            if (!chunk) { throw new Error('chunk is undefined') };
-            const chunkChars = chunk.length;
-
-            // Check if adding this chunk would exceed limits
-            const wouldExceedChars = currentBatchChars + chunkChars > MAX_CHARS_PER_REQUEST;
-            const wouldExceedInputs = currentBatch.length >= MAX_INPUTS_PER_REQUEST;
-
-            // Process current batch if we'd exceed limits
-            if ((wouldExceedChars || wouldExceedInputs) && currentBatch.length > 0) {
-                await processBatch(currentBatch, processedChunks);
-
-                processedChunks += currentBatch.length;
-                currentBatch = [];
-                currentBatchChars = 0;
-            }
-
-            // Add current chunk to batch
-            currentBatch.push(chunk);
-            currentBatchChars += chunkChars;
-        }
-
-        // Process remaining chunks
-        if (currentBatch.length > 0) {
-            console.log(`Processing final batch: ${currentBatch.length} chunks`);
-            await processBatch(currentBatch, processedChunks);
-            processedChunks += currentBatch.length;
-        }
-
-        console.log(`Completed: Processed ${processedChunks} total chunks`);
-        res.status(200).json({
-            success: true,
-            chunksProcessed: processedChunks
-        });
-    },
-    middlewares: [upload.single('file')]
-});
-
-const getEmbedding = async (text: string, retryCount = 0, OLLAMA_URL: string, OLLAMA_MODEL: string, MAX_RETRIES: number, RETRY_DELAY_MS: number): Promise<number[]> => {
-    try {
-        const response = await fetch(OLLAMA_URL, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                model: OLLAMA_MODEL,
-                prompt: text,
-                truncate: true, // Auto-truncate if over 256 tokens
-            }),
-        });
-
-        if (!response.ok) {
-            throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
-        }
-
-        const data = await response.json();
-        return data.embedding;
-    } catch (error) {
+      } catch (error) {
         if (retryCount < MAX_RETRIES) {
-            console.log(`Embedding failed, retry ${retryCount + 1}/${MAX_RETRIES}`);
-            await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * (retryCount + 1)));
-            return getEmbedding(text, retryCount + 1, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+          console.log(`Batch failed, retry ${retryCount + 1}/${MAX_RETRIES}`);
+          await processBatch(batch, startIndex, retryCount + 1);
         } else {
-            throw new Error(`Embedding failed after ${MAX_RETRIES} retries: ${error}`);
+          throw new Error(`Batch processing failed after ${MAX_RETRIES} retries: ${error}`);
         }
+      }
+    };
+
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      if (!chunk) { throw new Error('chunk is undefined') };
+      const chunkChars = chunk.length;
+
+      // Check if adding this chunk would exceed limits
+      const wouldExceedChars = currentBatchChars + chunkChars > MAX_CHARS_PER_REQUEST;
+      const wouldExceedInputs = currentBatch.length >= MAX_INPUTS_PER_REQUEST;
+
+      // Process current batch if we'd exceed limits
+      if ((wouldExceedChars || wouldExceedInputs) && currentBatch.length > 0) {
+        await processBatch(currentBatch, processedChunks);
+
+        processedChunks += currentBatch.length;
+        currentBatch = [];
+        currentBatchChars = 0;
+      }
+
+      // Add current chunk to batch
+      currentBatch.push(chunk);
+      currentBatchChars += chunkChars;
     }
+
+    // Process remaining chunks
+    if (currentBatch.length > 0) {
+      console.log(`Processing final batch: ${currentBatch.length} chunks`);
+      await processBatch(currentBatch, processedChunks);
+      processedChunks += currentBatch.length;
+    }
+
+    console.log(`Completed: Processed ${processedChunks} total chunks`);
+    res.status(200).json({
+      success: true,
+      chunksProcessed: processedChunks
+    });
+  },
+  middlewares: [upload.single('file')]
+});
+
+const getEmbedding = async (
+  text: string,
+  retryCount = 0,
+  OLLAMA_URL: string,
+  OLLAMA_MODEL: string,
+  MAX_RETRIES: number,
+  RETRY_DELAY_MS: number
+): Promise<number[]> => {
+  try {
+    const response = await fetch(OLLAMA_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: OLLAMA_MODEL,
+        prompt: text,
+        truncate: true, // Auto-truncate if over 256 tokens
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ollama API error: ${response.status} ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    return data.embedding;
+  } catch (error) {
+    if (retryCount < MAX_RETRIES) {
+      console.log(`Embedding failed, retry ${retryCount + 1}/${MAX_RETRIES}`);
+      await new Promise(resolve => setTimeout(resolve, RETRY_DELAY_MS * (retryCount + 1)));
+      return getEmbedding(text, retryCount + 1, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+    } else {
+      throw new Error(`Embedding failed after ${MAX_RETRIES} retries: ${error}`);
+    }
+  }
 };
 
 // Using Ollama. Install previously with.
 // ollama pull all-minilm
 // Warning: this is untested.
 BackendDB.route({
-    method: 'post',
-    path: '/local/rtbatch',
-    handler: async (db, req, res) => {
-        if (!req.file) { throw new Error('req.file is undefined') }
-        const fileBuffer: Buffer = req.file?.buffer;
-        const text = fileBuffer.toString();
-        const fileName = req.file.originalname;
+  method: 'post',
+  path: '/local/rtbatch',
+  handler: async (db, req, res) => {
+    if (!req.file) { throw new Error('req.file is undefined') }
+    const fileBuffer: Buffer = req.file?.buffer;
+    const text = fileBuffer.toString();
+    const fileName = req.file.originalname;
 
-        // Ollama configuration
-        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
-        const OLLAMA_MODEL = 'all-minilm';
-        // all-minilm limits: 256 tokens max
-        // Use 1 char = 1 token worst case to guarantee we stay under limit
-        const MAX_CHARS_PER_CHUNK = 256;
-        const MAX_RETRIES = 3;
-        const RETRY_DELAY_MS = 1000;
+    // Ollama configuration
+    const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+    const OLLAMA_MODEL = 'all-minilm';
+    // all-minilm limits: 256 tokens max
+    // Use 1 char = 1 token worst case to guarantee we stay under limit
+    const MAX_CHARS_PER_CHUNK = 256;
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 1000;
 
-        console.log(`Max chars per chunk: ${MAX_CHARS_PER_CHUNK}`);
+    console.log(`Max chars per chunk: ${MAX_CHARS_PER_CHUNK}`);
 
-        // Chunk the text
-        const chunks: string[] = [];
-        for (let i = 0; i < text.length; i += MAX_CHARS_PER_CHUNK) {
-            const chunk = text.slice(i, i + MAX_CHARS_PER_CHUNK).trim();
-            if (chunk) {
-                chunks.push(chunk);
-            }
-        }
+    // Chunk the text
+    const chunks: string[] = [];
+    for (let i = 0; i < text.length; i += MAX_CHARS_PER_CHUNK) {
+      const chunk = text.slice(i, i + MAX_CHARS_PER_CHUNK).trim();
+      if (chunk) {
+        chunks.push(chunk);
+      }
+    }
 
-        console.log(`Created ${chunks.length} chunks`);
+    console.log(`Created ${chunks.length} chunks`);
 
-        // Process chunks sequentially (Ollama handles one at a time)
-        let processedChunks = 0;
+    // Process chunks sequentially (Ollama handles one at a time)
+    let processedChunks = 0;
 
-        for (let i = 0; i < chunks.length; i++) {
-            const chunk = chunks[i];
-            if (!chunk) { throw new Error('chunk is undefined') };
+    for (let i = 0; i < chunks.length; i++) {
+      const chunk = chunks[i];
+      if (!chunk) { throw new Error('chunk is undefined') };
 
-            try {
-                console.log(`Processing chunk ${i + 1}/${chunks.length}`);
+      try {
+        console.log(`Processing chunk ${i + 1}/${chunks.length}`);
 
-                // Get embedding from Ollama
-                const embedding = await getEmbedding(chunk, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+        // Get embedding from Ollama
+        const embedding = await getEmbedding(chunk, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
 
-                // Insert into database
-                await db.insert(textChunks).values({
-                    documentId: fileName,
-                    chunkIndex: i,
-                    content: chunk,
-                    embedding,
-                }).returning();
+        // Insert into database
+        await db.insert(textChunks).values({
+          documentId: fileName,
+          chunkIndex: i,
+          content: chunk,
+          embedding,
+        }).returning();
 
-                processedChunks++;
-                console.log(`Inserted chunk ${i + 1}/${chunks.length}`);
-            } catch (error) {
-                console.error(`Failed to process chunk ${i + 1}:`, error);
-                throw new Error(`Chunk ${i + 1} failed: ${error}`);
-            }
-        }
+        processedChunks++;
+        console.log(`Inserted chunk ${i + 1}/${chunks.length}`);
+      } catch (error) {
+        console.error(`Failed to process chunk ${i + 1}:`, error);
+        throw new Error(`Chunk ${i + 1} failed: ${error}`);
+      }
+    }
 
-        console.log(`Completed: Processed ${processedChunks} total chunks`);
-        res.status(200).json({
-            success: true,
-            chunksProcessed: processedChunks
-        });
-    },
-    middlewares: [upload.single('file')]
+    console.log(`Completed: Processed ${processedChunks} total chunks`);
+    res.status(200).json({
+      success: true,
+      chunksProcessed: processedChunks
+    });
+  },
+  middlewares: [upload.single('file')]
 });
 
 BackendDB.route({
-    method: 'get',
-    path: '/local/chunks/:input',
-    handler: async (db, req, res) => {
-        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
-        const OLLAMA_MODEL = 'all-minilm';
-        // all-minilm limits: 256 tokens max
-        // Use 1 char = 1 token worst case to guarantee we stay under limit
-        const MAX_RETRIES = 3;
-        const RETRY_DELAY_MS = 1000;
-        const { input } = req.params;
-        if (!input) {
-            throw new Error('embedding input undefined');
-        }
-        // const { data } = await openai.embeddings.create({
-        //     model: 'text-embedding-3-small',
-        //     dimensions: 384,
-        //     input,
-        // });
-        const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+  method: 'get',
+  path: '/local/chunks/:input',
+  handler: async (db, req, res) => {
+    const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+    const OLLAMA_MODEL = 'all-minilm';
+    // all-minilm limits: 256 tokens max
+    // Use 1 char = 1 token worst case to guarantee we stay under limit
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 1000;
+    const { input } = req.params;
+    if (!input) {
+      throw new Error('embedding input undefined');
+    }
+    // const { data } = await openai.embeddings.create({
+    //     model: 'text-embedding-3-small',
+    //     dimensions: 384,
+    //     input,
+    // });
+    const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
 
-        // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
-        const vectorString = `[${queryEmbedding.join(',')}]`;
-        const results = await db
-            .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
-            .from(textChunks)
-            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
-            .limit(5);
+    // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+    const vectorString = `[${queryEmbedding.join(',')}]`;
+    const results = await db
+      .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+      .from(textChunks)
+      .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
+      .limit(5);
 
-        const context = [];
-        // const context = results.map(async (result) => {
-        for (let i = 0; i < results.length; i++) {
-            let output = results[i]?.content;
-            let expand = { before: "yes", after: "yes" };
-            const index = results[i]?.chunkIndex;
-            if (!index) { throw new Error("index undefined") }
-            let indexbefore = index - 1;
-            let indexafter = index + 1;
-            // console.log("Checking", output);
-            while (expand.before === "yes" || expand.after === "yes") {
-                const beforechunk = await db
-                    .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
-                    .from(textChunks)
-                    .where(eq(textChunks.chunkIndex, indexbefore));
-                const afterchunk = await db
-                    .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
-                    .from(textChunks)
-                    .where(eq(textChunks.chunkIndex, indexafter));
-                const format = {
-                    type: 'object',
-                    properties: {
-                        before: {
-                            type: 'string',
-                            enum: ['yes', 'no']
-                        },
-                        after: {
-                            type: 'string',
-                            enum: ['yes', 'no']
-                        }
-                    },
-                    required: ['before', 'after']
-                };
-                const prompt = `Does this chunk feel complete?
+    const context = [];
+    // const context = results.map(async (result) => {
+    for (let i = 0; i < results.length; i++) {
+      let output = results[i]?.content;
+      let expand = { before: "yes", after: "yes" };
+      const index = results[i]?.chunkIndex;
+      if (!index) { throw new Error("index undefined") }
+      let indexbefore = index - 1;
+      let indexafter = index + 1;
+      // console.log("Checking", output);
+      while (expand.before === "yes" || expand.after === "yes") {
+        const beforechunk = await db
+          .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+          .from(textChunks)
+          .where(eq(textChunks.chunkIndex, indexbefore));
+        const afterchunk = await db
+          .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+          .from(textChunks)
+          .where(eq(textChunks.chunkIndex, indexafter));
+        const format = {
+          type: 'object',
+          properties: {
+            before: {
+              type: 'string',
+              enum: ['yes', 'no']
+            },
+            after: {
+              type: 'string',
+              enum: ['yes', 'no']
+            }
+          },
+          required: ['before', 'after']
+        };
+        const prompt = `Does this chunk feel complete?
 CHUNK:
 "${output}"
 
@@ -483,108 +490,108 @@ Consider the chunk should be useful to this query:
 "${input}"
 
 Respond with JSON only.`;
-                const reply = await axios.post('http://localhost:11434/api/generate', {
-                    model: 'qwen2.5:1.5b',
-                    prompt: prompt,
-                    format,  // Request JSON format
-                    stream: false
-                });
-                // console.log(`Expansion choice ${JSON.stringify(reply.data.response)}`);
-                expand = JSON.parse(reply.data.response);
-                console.log(`Chunk ${i} expand ${JSON.stringify(expand)}`);
-                if (expand.before === "yes") { output = `${beforechunk[0]?.content}${output}`; indexbefore--; }
-                if (expand.after === "yes") { output = `${output}${afterchunk[0]?.content}`; indexafter++; }
-                // console.log(`current output`, output);
-            }
-            console.log(`Chunk ${i} done`)
-            context.push(output);
-            // });
-        }
-        console.log('Final context', JSON.stringify(context));
-        const prompt2 = `Answer this query: ${input}\nUsing the following chunks of context:\n${JSON.stringify(context)}`;
         const reply = await axios.post('http://localhost:11434/api/generate', {
-            model: 'qwen2.5:1.5b',
-            prompt: prompt2,
-            stream: false
+          model: 'qwen2.5:1.5b',
+          prompt: prompt,
+          format,  // Request JSON format
+          stream: false
         });
-        res.json(reply.data.response);
+        // console.log(`Expansion choice ${JSON.stringify(reply.data.response)}`);
+        expand = JSON.parse(reply.data.response);
+        console.log(`Chunk ${i} expand ${JSON.stringify(expand)}`);
+        if (expand.before === "yes") { output = `${beforechunk[0]?.content}${output}`; indexbefore--; }
+        if (expand.after === "yes") { output = `${output}${afterchunk[0]?.content}`; indexafter++; }
+        // console.log(`current output`, output);
+      }
+      console.log(`Chunk ${i} done`)
+      context.push(output);
+      // });
     }
+    console.log('Final context', JSON.stringify(context));
+    const prompt2 = `Answer this query: ${input}\nUsing the following chunks of context:\n${JSON.stringify(context)}`;
+    const reply = await axios.post('http://localhost:11434/api/generate', {
+      model: 'qwen2.5:1.5b',
+      prompt: prompt2,
+      stream: false
+    });
+    res.json(reply.data.response);
+  }
 });
 
 const dsai = new OpenAI({
-    baseURL: 'https://api.deepseek.com',
-    apiKey: process.env.DEEPSEEK_KEY
+  baseURL: 'https://api.deepseek.com',
+  apiKey: process.env.DEEPSEEK_KEY
 })
 
 BackendDB.route({
-    method: 'get',
-    path: '/deepseek/chunks/:input',
-    handler: async (db, req, res) => {
-        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
-        const OLLAMA_MODEL = 'all-minilm';
-        // all-minilm limits: 256 tokens max
-        // Use 1 char = 1 token worst case to guarantee we stay under limit
-        const MAX_RETRIES = 3;
-        const RETRY_DELAY_MS = 1000;
-        const { input } = req.params;
-        if (!input) {
-            throw new Error('embedding input undefined');
-        }
-        // const { data } = await openai.embeddings.create({
-        //     model: 'text-embedding-3-small',
-        //     dimensions: 384,
-        //     input,
-        // });
-        const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+  method: 'get',
+  path: '/deepseek/chunks/:input',
+  handler: async (db, req, res) => {
+    const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+    const OLLAMA_MODEL = 'all-minilm';
+    // all-minilm limits: 256 tokens max
+    // Use 1 char = 1 token worst case to guarantee we stay under limit
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 1000;
+    const { input } = req.params;
+    if (!input) {
+      throw new Error('embedding input undefined');
+    }
+    // const { data } = await openai.embeddings.create({
+    //     model: 'text-embedding-3-small',
+    //     dimensions: 384,
+    //     input,
+    // });
+    const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
 
-        // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
-        const vectorString = `[${queryEmbedding.join(',')}]`;
-        const results = await db
-            .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
-            .from(textChunks)
-            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
-            .limit(5);
+    // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+    const vectorString = `[${queryEmbedding.join(',')}]`;
+    const results = await db
+      .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+      .from(textChunks)
+      .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
+      .limit(5);
 
-        const context = [];
-        // const context = results.map(async (result) => {
-        for (let i = 0; i < results.length; i++) {
-            let output = results[i]?.content;
-            let expand = { before: "yes", after: "yes" };
-            const index = results[i]?.chunkIndex;
-            if (!index) { throw new Error("index undefined") }
-            let indexbefore = index - 1;
-            let indexafter = index + 1;
-            // console.log("Checking", output);
-            while (expand.before === "yes" || expand.after === "yes") {
-                const beforechunk = await db
-                    .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
-                    .from(textChunks)
-                    .where(eq(textChunks.chunkIndex, indexbefore));
-                const afterchunk = await db
-                    .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
-                    .from(textChunks)
-                    .where(eq(textChunks.chunkIndex, indexafter));
-                const format = {
-                    type: 'object',
-                    properties: {
-                        before: {
-                            type: 'string',
-                            enum: ['yes', 'no']
-                        },
-                        after: {
-                            type: 'string',
-                            enum: ['yes', 'no']
-                        }
-                    },
-                    required: ['before', 'after']
-                };
-                const system = `The user will ask if a text chunk feels complete, you will be asked if the chunk should be expanded with some text before, and/or after.
+    const context = [];
+    // const context = results.map(async (result) => {
+    for (let i = 0; i < results.length; i++) {
+      let output = results[i]?.content;
+      let expand = { before: "yes", after: "yes" };
+      const index = results[i]?.chunkIndex;
+      if (!index) { throw new Error("index undefined") }
+      let indexbefore = index - 1;
+      let indexafter = index + 1;
+      // console.log("Checking", output);
+      while (expand.before === "yes" || expand.after === "yes") {
+        const beforechunk = await db
+          .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+          .from(textChunks)
+          .where(eq(textChunks.chunkIndex, indexbefore));
+        const afterchunk = await db
+          .select({ chunkIndex: textChunks.chunkIndex, content: textChunks.content })
+          .from(textChunks)
+          .where(eq(textChunks.chunkIndex, indexafter));
+        const format = {
+          type: 'object',
+          properties: {
+            before: {
+              type: 'string',
+              enum: ['yes', 'no']
+            },
+            after: {
+              type: 'string',
+              enum: ['yes', 'no']
+            }
+          },
+          required: ['before', 'after']
+        };
+        const system = `The user will ask if a text chunk feels complete, you will be asked if the chunk should be expanded with some text before, and/or after.
 EXAMPLE OUTPUT
 
 { "before": "yes", "after": "no"}
 
 `
-                const prompt = `Does the subject in this chunk feel complete?
+        const prompt = `Does the subject in this chunk feel complete?
 CHUNK:
 "${output}"
 
@@ -602,192 +609,197 @@ Consider the chunk should be useful to this query:
 "${input}"
 
 Respond with JSON only.`;
-                const reply = await dsai.chat.completions.create({
-                    messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
-                    model: "deepseek-chat",
-                    response_format: { 'type': 'json_object' }
-                });
-                // console.log(`Expansion choice ${JSON.stringify(reply.data.response)}`);
-                if (!reply.choices[0]?.message.content) { throw new Error('content undefined'); }
-                expand = JSON.parse(reply.choices[0]?.message.content);
-                console.log(`Chunk ${i} expand ${JSON.stringify(expand)}`);
-                if (expand.before === "yes") { output = `${beforechunk[0]?.content}${output}`; indexbefore--; }
-                if (expand.after === "yes") { output = `${output}${afterchunk[0]?.content}`; indexafter++; }
-                // console.log(`current output`, output);
-            }
-            console.log(`Chunk ${i} done`)
-            context.push(output);
-            // });
-        }
-        console.log('Final context', JSON.stringify(context));
-        // const prompt2 = `Answer this query: ${input}\nUsing the following chunks of context:\n${JSON.stringify(context)}`;
         const reply = await dsai.chat.completions.create({
-            messages: [{ role: 'system', content: `Use this context to reply the user's query: ${context}` }, { role: 'user', content: input }],
-            model: "deepseek-chat",
+          messages: [{ role: 'system', content: system }, { role: 'user', content: prompt }],
+          model: "deepseek-chat",
+          response_format: { 'type': 'json_object' }
         });
-        res.json(reply.choices[0]?.message.content);
+        // console.log(`Expansion choice ${JSON.stringify(reply.data.response)}`);
+        if (!reply.choices[0]?.message.content) { throw new Error('content undefined'); }
+        expand = JSON.parse(reply.choices[0]?.message.content);
+        console.log(`Chunk ${i} expand ${JSON.stringify(expand)}`);
+        if (expand.before === "yes") { output = `${beforechunk[0]?.content}${output}`; indexbefore--; }
+        if (expand.after === "yes") { output = `${output}${afterchunk[0]?.content}`; indexafter++; }
+        // console.log(`current output`, output);
+      }
+      console.log(`Chunk ${i} done`)
+      context.push(output);
+      // });
     }
+    console.log('Final context', JSON.stringify(context));
+    // const prompt2 = `Answer this query: ${input}\nUsing the following chunks of context:\n${JSON.stringify(context)}`;
+    const reply = await dsai.chat.completions.create({
+      messages: [{ role: 'system', content: `Use this context to reply the user's query: ${context}` }, { role: 'user', content: input }],
+      model: "deepseek-chat",
+    });
+    res.json(reply.choices[0]?.message.content);
+  }
 });
 
 BackendDB.route({
-    method: 'get',
-    path: '/recursive/chunks/:input',
-    handler: async (db, req, res) => {
-        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
-        const OLLAMA_MODEL = 'all-minilm';
-        const MAX_RETRIES = 3;
-        const RETRY_DELAY_MS = 1000;
-        const { input } = req.params;
-        if (!input) {
-            throw new Error('embedding input undefined');
-        }
-        const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
-
-        // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
-        const vectorString = `[${queryEmbedding.join(',')}]`;
-
-        const results = await db
-            .select({ embedding: textChunks.embedding, chunkIndex: textChunks.chunkIndex })
-            .from(textChunks)
-            .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
-            .limit(5);
-
-        // loop through all results later
-        const pivotEmbedding = results[0];
-
-        const pivotChunkIndex = pivotEmbedding?.chunkIndex;
-        if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
-        console.log(`pivot index ${pivotChunkIndex}`);
-        const pivotEmbeddingSubquery = db
-            .select({ embedding: textChunks.embedding })
-            .from(textChunks)
-            .where(eq(textChunks.chunkIndex, pivotChunkIndex))
-            .limit(1);
-        const distanceFromPivot = sql<number>`(${pivotEmbeddingSubquery}) <=> ${textChunks.embedding}`;
-
-        // Use it in your query
-        const results2 = await db
-            .select({
-                pivotChunkIndex: sql<number>`${pivotChunkIndex}`,
-                comparedChunkIndex: textChunks.chunkIndex,
-                distance: distanceFromPivot
-            })
-            .from(textChunks)
-            .where(
-                sql`${textChunks.chunkIndex} BETWEEN ${pivotChunkIndex - 100} AND ${pivotChunkIndex + 100}`
-            )
-            .orderBy(textChunks.chunkIndex);
-
-        res.json(results2);
+  method: 'get',
+  path: '/recursive/chunks/:input',
+  handler: async (db, req, res) => {
+    const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+    const OLLAMA_MODEL = 'all-minilm';
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 1000;
+    const { input } = req.params;
+    if (!input) {
+      throw new Error('embedding input undefined');
     }
+    const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+
+    // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+    const vectorString = `[${queryEmbedding.join(',')}]`;
+
+    const results = await db
+      .select({ embedding: textChunks.embedding, chunkIndex: textChunks.chunkIndex })
+      .from(textChunks)
+      .orderBy(sql.raw(`embedding <=> '${vectorString}'::vector`), textChunks.chunkIndex)
+      .limit(5);
+
+    // loop through all results later
+    const pivotEmbedding = results[0];
+
+    const pivotChunkIndex = pivotEmbedding?.chunkIndex;
+    if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
+    console.log(`pivot index ${pivotChunkIndex}`);
+    const pivotEmbeddingSubquery = db
+      .select({ embedding: textChunks.embedding })
+      .from(textChunks)
+      .where(eq(textChunks.chunkIndex, pivotChunkIndex))
+      .limit(1);
+    const distanceFromPivot = sql.raw(`(${pivotEmbeddingSubquery}) <=> ${textChunks.embedding}`);
+
+    // Use it in your query
+    const results2 = await db
+      .select({
+        pivotChunkIndex: sql.raw(`${pivotChunkIndex}`),
+        comparedChunkIndex: textChunks.chunkIndex,
+        distance: distanceFromPivot
+      })
+      .from(textChunks)
+      .where(
+        sql`${textChunks.chunkIndex} BETWEEN ${pivotChunkIndex - 100} AND ${pivotChunkIndex + 100}`
+      )
+      .orderBy(textChunks.chunkIndex);
+
+    res.json(results2);
+  }
 });
 
 BackendDB.route({
-    method: 'get',
-    path: '/semantic/chunks/:input',
-    handler: async (db, req, res) => {
-        const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
-        const OLLAMA_MODEL = 'all-minilm';
-        const MAX_RETRIES = 3;
-        const RETRY_DELAY_MS = 1000;
-        const { input } = req.params;
-        if (!input) {
-            throw new Error('embedding input undefined');
-        }
-        const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
-
-        // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
-        const vectorString = `[${queryEmbedding.join(',')}]`;
-
-        const limit = 500;
-        const results = await db
-            .select({
-                embedding: textChunks.embedding,
-                chunkIndex: textChunks.chunkIndex,
-                distance: sql<number>`embedding <=> ${vectorString}::vector`
-            })
-            .from(textChunks)
-            .orderBy(sql`embedding <=> ${vectorString}::vector`)
-            .limit(limit);
-
-        const mindist = Math.min(...results.map((chunk) => chunk.distance));
-        const maxdist = Math.max(...results.map((chunk) => chunk.distance));
-        const toppercent = 60;
-        const threshhold = mindist+((toppercent*(maxdist - mindist))/100);
-
-        const filtered = results.filter((chunk) => chunk.distance <= threshhold);
-        console.log('smallest picked', filtered.length);
-
-        const context = [];
-        for (let x = 0; x < filtered.length; x++) {
-            const pivotEmbedding = filtered[x];
-            const pivotChunkIndex = pivotEmbedding?.chunkIndex;
-            if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
-            const pivotEmbeddingSubquery = db
-                .select({ embedding: textChunks.embedding })
-                .from(textChunks)
-                .where(eq(textChunks.chunkIndex, pivotChunkIndex))
-                .limit(1);
-            const distanceFromPivot = sql<number>`(${pivotEmbeddingSubquery}) <=> ${textChunks.embedding}`;
-            const range = 115;
-            const results2 = await db
-                .select({
-                    pivotChunkIndex: sql<number>`${pivotChunkIndex}`,
-                    comparedChunkIndex: textChunks.chunkIndex,
-                    distance: distanceFromPivot,
-                    content: textChunks.content
-                })
-                .from(textChunks)
-                .where(
-                    sql`${textChunks.chunkIndex} BETWEEN ${pivotChunkIndex - range} AND ${pivotChunkIndex + range}`
-                )
-                .orderBy(textChunks.chunkIndex);
-            const sum = results2.reduce((acc, val) => acc + val.distance, 0);
-            const mean = sum / results2.length;
-            const roll = 15;
-            let leftra = 0;
-            let rightra = 0;
-            let leftix, rightix;
-            for (
-                let i = range, j = range;
-                i > roll && j < results2.length - roll;
-                i--, j++
-            ) {
-                if (leftra < mean && !rightix) {
-                    for (let k = i - roll; k < i + roll; k++) {
-                        leftra += results2[k]?.distance as number;
-                    }
-                    leftra /= (2 * roll);
-                } else if (!leftix) {
-                    leftix = i;
-                }
-                if (rightra < mean) {
-                    for (let k = j - roll; k < j + roll; k++) {
-                        rightra += results2[k]?.distance as number;
-                    }
-                    rightra /= (2 * roll);
-                } else if (!rightix) {
-                    rightix = j;
-                }
-                if (leftix && rightix) { break; }
-            }
-            const chunks = results2.slice(leftix, rightix);
-            const finalchunk = chunks.map((chunk) => chunk.content).join('');
-            context.push(finalchunk);
-        }
-        const reply = await dsai.chat.completions.create({
-            messages: [
-                {
-                    role: 'system',
-                    content: `Quote this context to reply the user's query: ${JSON.stringify(context)}`
-                },
-                {
-                    role: 'user',
-                    content: input
-                }
-            ],
-            model: "deepseek-chat",
-        });
-        res.json(reply.choices[0]?.message.content);
+  method: 'get',
+  path: '/semantic/chunks/:input',
+  handler: async (db, req, res) => {
+    const OLLAMA_URL = 'http://localhost:11434/api/embeddings';
+    const OLLAMA_MODEL = 'all-minilm';
+    const MAX_RETRIES = 3;
+    const RETRY_DELAY_MS = 1000;
+    const { input } = req.params;
+    if (!input) {
+      throw new Error('embedding input undefined');
     }
+    const queryEmbedding = await getEmbedding(input, 3, OLLAMA_URL, OLLAMA_MODEL, MAX_RETRIES, RETRY_DELAY_MS);
+
+    // const queryEmbedding: Array<number> = data[0]?.embedding as Array<number>;
+    const vectorString = `[${queryEmbedding.join(',')}]`;
+
+    const limit = 500;
+    const results = await db
+      .select({
+        embedding: textChunks.embedding,
+        chunkIndex: textChunks.chunkIndex,
+        distance: sql.raw(`embedding <=> ${vectorString}::vector`)
+      })
+      .from(textChunks)
+      .orderBy(sql`embedding <=> ${vectorString}::vector`)
+      .limit(limit);
+
+    const mindist = Math.min(...results.map((chunk) => chunk.distance as number));
+    const maxdist = Math.max(...results.map((chunk) => chunk.distance as number));
+    const toppercent = 60;
+    const threshhold = mindist + ((toppercent * (maxdist - mindist)) / 100);
+
+    const filtered = results.filter((chunk) => chunk.distance as number <= threshhold);
+    console.log('smallest picked', filtered.length);
+
+    const context = [];
+    for (let x = 0; x < filtered.length; x++) {
+      const pivotEmbedding = filtered[x];
+      const pivotChunkIndex = pivotEmbedding?.chunkIndex;
+      if (!pivotChunkIndex) { throw new Error('pivotChunkIndex undefined'); }
+      const pivotEmbeddingSubquery = db
+        .select({ embedding: textChunks.embedding })
+        .from(textChunks)
+        .where(eq(textChunks.chunkIndex, pivotChunkIndex))
+        .limit(1);
+      const distanceFromPivot = sql.raw(`(${pivotEmbeddingSubquery}) <=> ${textChunks.embedding}`);
+      const range = 115;
+      const results2 = await db
+        .select({
+          pivotChunkIndex: sql.raw(`${pivotChunkIndex}`),
+          comparedChunkIndex: textChunks.chunkIndex,
+          distance: distanceFromPivot,
+          content: textChunks.content
+        })
+        .from(textChunks)
+        .where(
+          sql`${textChunks.chunkIndex} BETWEEN ${pivotChunkIndex - range} AND ${pivotChunkIndex + range}`
+        )
+        .orderBy(textChunks.chunkIndex);
+      const sum = results2.reduce((acc, val) => acc + (val.distance as number), 0);
+      const mean = sum / results2.length;
+      const roll = 15;
+      let leftra = 0;
+      let rightra = 0;
+      let leftix, rightix;
+      for (
+        let i = range, j = range;
+        i > roll && j < results2.length - roll;
+        i--, j++
+      ) {
+        if (leftra < mean && !rightix) {
+          for (let k = i - roll; k < i + roll; k++) {
+            leftra += results2[k]?.distance as number;
+          }
+          leftra /= (2 * roll);
+        } else if (!leftix) {
+          leftix = i;
+        }
+        if (rightra < mean) {
+          for (let k = j - roll; k < j + roll; k++) {
+            rightra += results2[k]?.distance as number;
+          }
+          rightra /= (2 * roll);
+        } else if (!rightix) {
+          rightix = j;
+        }
+        if (leftix && rightix) { break; }
+      }
+      const chunks = results2.slice(leftix, rightix);
+      const finalchunk = chunks.map((chunk) => chunk.content).join('');
+      context.push(finalchunk);
+    }
+    const reply = await dsai.chat.completions.create({
+      messages: [
+        {
+          role: 'system',
+          content: `Quote this context to reply the user's query: ${JSON.stringify(context)}`
+        },
+        {
+          role: 'user',
+          content: input
+        }
+      ],
+      model: "deepseek-chat",
+    });
+    res.json(reply.choices[0]?.message.content);
+  }
 });
+
+if (true) {
+  console.log("hello");
+}
+
